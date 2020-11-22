@@ -284,6 +284,8 @@ def message_attributes_to_lower(message_attrs):
 def process_apigateway_invocation(func_arn, path, payload, stage, api_id, headers={},
                                   resource_path=None, method=None, path_params={},
                                   query_string_params=None, request_context={}, event_context={}):
+    query_string_params = query_string_params or {}
+
     try:
         resource_path = resource_path or path
         path_params = dict(path_params)
@@ -304,9 +306,47 @@ def process_apigateway_invocation(func_arn, path, payload, stage, api_id, header
         }
         LOG.debug('Running Lambda function %s from API Gateway invocation: %s %s' % (func_arn, method or 'GET', path))
         return run_lambda(event=event, context=event_context, func_arn=func_arn,
-            asynchronous=not config.SYNCHRONOUS_API_GATEWAY_EVENTS)
+                          asynchronous=not config.SYNCHRONOUS_API_GATEWAY_EVENTS)
     except Exception as e:
         LOG.warning('Unable to run Lambda function on API Gateway message: %s %s' % (e, traceback.format_exc()))
+
+
+def process_apigateway_custom_authorizer_invocation(authorizer, func_arn,
+                                                    path, payload,
+                                                    stage, api_id, headers={},
+                                                    resource_path=None,
+                                                    method=None, path_params={},
+                                                    query_string_params=None,
+                                                    request_context={},
+                                                    event_context={}):
+    query_string_params = query_string_params or {}
+
+    try:
+        resource_path = resource_path or path
+        path_params = dict(path_params)
+        fix_proxy_path_params(path_params)
+        event = {
+            'type': authorizer['type'],
+            'methodArn': '',
+            'path': path,
+            'headers': dict(headers),
+            'multiValueHeaders': multi_value_dict_for_list(headers),
+            'pathParameters': path_params,
+            'body': payload,
+            'isBase64Encoded': False,
+            'resource': resource_path,
+            'httpMethod': method,
+            'queryStringParameters': query_string_params,
+            'multiValueQueryStringParameters': multi_value_dict_for_list(query_string_params),
+            'requestContext': request_context,
+            'stageVariables': get_stage_variables(api_id, stage),
+        }
+
+        LOG.debug('Running Lambda function %s as API Gateway custom authorizer: %s %s' % (func_arn, method or 'GET', path))
+        return run_lambda(event=event, context=event_context, func_arn=func_arn,
+                          asynchronous=not config.SYNCHRONOUS_API_GATEWAY_EVENTS)
+    except Exception as e:
+        LOG.warning('Unable to run Lambda function as API Gateway custom authorizer: %s %s' % (e, traceback.format_exc()))
 
 
 def process_sns_notification(func_arn, topic_arn, subscription_arn, message, message_id,

@@ -19,7 +19,8 @@ from localstack.services.apigateway import helpers
 from localstack.services.generic_proxy import ProxyListener
 from localstack.utils.aws.aws_responses import flask_to_requests_response, requests_response, LambdaResponse
 from localstack.services.apigateway.helpers import (get_resource_for_path, handle_authorizers,
-    extract_query_string_params, extract_path_params, make_error_response, get_cors_response)
+                                                    extract_query_string_params, extract_path_params,
+                                                    make_error_response, get_cors_response)
 
 # set up logger
 LOGGER = logging.getLogger(__name__)
@@ -67,13 +68,17 @@ class ProxyListenerApiGateway(ProxyListener):
         # publish event
         if method == 'POST' and path == '/restapis':
             content = json.loads(to_str(response.content))
-            event_publisher.fire_event(event_publisher.EVENT_APIGW_CREATE_API,
-                payload={'a': event_publisher.get_hash(content['id'])})
+            event_publisher.fire_event(
+                event_publisher.EVENT_APIGW_CREATE_API,
+                payload={'a': event_publisher.get_hash(content['id'])}
+            )
         api_regex = r'^/restapis/([a-zA-Z0-9\-]+)$'
         if method == 'DELETE' and re.match(api_regex, path):
             api_id = re.sub(api_regex, r'\1', path)
-            event_publisher.fire_event(event_publisher.EVENT_APIGW_DELETE_API,
-                payload={'a': event_publisher.get_hash(api_id)})
+            event_publisher.fire_event(
+                event_publisher.EVENT_APIGW_DELETE_API,
+                payload={'a': event_publisher.get_hash(api_id)}
+            )
 
 
 # ------------
@@ -134,20 +139,145 @@ def put_gateway_response(api_id, response_type, data):
     return data
 
 
-def run_authorizer(api_id, headers, authorizer):
-    # TODO implement authorizers
-    pass
+def run_authorizer(authorizer, api_id, stage, method, data, headers, path,
+                   invocation_path, integration):
+    LOGGER.warning(f"run_authorizer {authorizer}")
+    """
+    authorizer:
+        {
+            'id': '435bf557',
+            'name': 'clabs-authorizer',
+            'type': 'REQUEST',
+            'authorizerUri': 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:api-gateway-auth-api/invocations',
+            'authorizerResultTtlInSeconds': 300
+        }
+    """
+    # TESTE:
+    # headers.set("User-Id", "USER-ID")
+    # ↑ Yeap, that works well.
+    # LOGGER.warning(">>> Set User-Id header <<<")
+
+    # Other test:
+    uri = authorizer['authorizerUri']
+    func_arn = uri.split(':lambda:path')[1].split('functions/')[1].split('/invocations')[0]
+
+    LOGGER.warning(">>> request_context <<<")
+    # def get_lambda_event_request_context(method, path, data, headers, integration_uri=None, resource_id=None):
+    request_context = get_lambda_event_request_context(
+        'GET', path, None, headers,
+        integration_uri=uri, resource_id=None)
+
+    LOGGER.warning(">>> process_apigateway_custom_authorizer_invocation <<<")
+
+    relative_path, query_string_params = extract_query_string_params(path=invocation_path)
+    data_str = json.dumps(data) if isinstance(data, (dict, list)) else to_str(data)
+    # apply custom request template
+    data_str = apply_template(integration, 'request', data_str, path_params={},
+                              query_params=query_string_params, headers=headers)
+    result = lambda_api.process_apigateway_custom_authorizer_invocation(
+        authorizer,
+        func_arn, '', '',
+        stage, api_id, headers=headers,
+        resource_path=path, request_context=request_context,
+        event_context={'Type': 'REQUEST', 'type': 'REQUEST'})
+
+    LOGGER.warning(f">>> AUTHORIZER RESULT: {result} <<<")
+    LOGGER.warning(type(result))
+    # result:
+    # {"principalId":"user","policyDocument":{"Version":"","Statement":null},"context":{"user_id":"01EQKXT9267TVDGH6XEVP46AE1"}}
+    if isinstance(result, dict):
+        headers.update(result['context'])
+        return
+    elif isinstance(result, str):
+        data = json.loads(result)
+        headers.update(data.get('context', {}))
+    elif isinstance(result, FlaskResponse):
+        if result.status_code // 100 != 2:
+            return result
+
+        if isinstance(result.data, dict):
+            headers.update(result.data.get('context', {}))
+        else:
+            data = json.loads(result.data)
+            headers.update(data.get('context', {}))
+        return
+    else:
+        return result
 
 
-def authorize_invocation(api_id, headers):
+def authorize_invocation(api_id, resource_id, stage, method, data, headers,
+                         path, invocation_path, integration):
+    LOGGER.warning(f"authorize_invocation: {headers}")
+
+    # Do we really need an authorizer?
     client = aws_stack.connect_to_service('apigateway')
-    authorizers = client.get_authorizers(restApiId=api_id, limit=100).get('items', [])
-    for authorizer in authorizers:
-        run_authorizer(api_id, headers, authorizer)
+
+    response = client.get_method(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod=method
+    )
+
+    LOGGER.warning(f"client.get_method.response: {response}")
+
+    """
+    {
+        'ResponseMetadata': {
+            'HTTPStatusCode': 200,
+            'HTTPHeaders': {
+                'content-type': 'text/html; charset=utf-8',
+                'content-length': '661', 'access-control-allow-origin': '*', 'access-control-allow-methods': 'HEAD,GET,PUT,POST,DELETE,OPTIONS,PATCH', 'access-control-allow-headers': 'authorization,content-type,content-md5,cache-control,x-amz-content-sha256,x-amz-date,x-amz-security-token,x-amz-user-agent,x-amz-target,x-amz-acl,x-amz-version-id,x-localstack-target,x-amz-tagging', 'access-control-expose-headers': 'x-amz-version-id', 'connection': 'close', 'date': 'Sun, 22 Nov 2020 17:33:08 GMT', 'server': 'hypercorn-h11'
+            },
+            'RetryAttempts': 0
+        },
+        'httpMethod': 'GET',
+        'authorizationType': 'CUSTOM',
+        'apiKeyRequired': False,
+        'methodIntegration': {
+            'type': 'AWS_PROXY',
+            'httpMethod': 'POST',
+            'uri': 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:users-rest-api/invocations',
+            'requestParameters': {},
+            'passthroughBehavior': 'WHEN_NO_MATCH',
+            'cacheNamespace': 'e9ee92b2',
+            'cacheKeyParameters': [],
+            'integrationResponses': {
+                '200': {'statusCode': 200, 'responseTemplates': {'application/json': None}}
+            }
+        }
+    }
+    """
+
+    # We only support CUSTOM authorizers for now:
+    authorization_type = response['authorizationType']
+    if authorization_type != 'CUSTOM':
+        return
+
+    authorizer_id = response.get('authorizerId', None)
+    if authorizer_id is not None:
+        authorizer = client.get_authorizer(
+            restApiId=api_id,
+            authorizerId=authorizer_id
+        )
+    else:
+        authorizers = client.get_authorizers(
+            restApiId=api_id, limit=1
+        )['items']
+        try:
+            authorizer = authorizers[0]
+        except IndexError:
+            raise Exception(
+                "Method has CUSTOM authorizer, but no authorizer was found"
+            )
+
+    return run_authorizer(
+        authorizer, api_id, stage, method,
+        data, headers, path, invocation_path,
+        integration
+    )
 
 
 def validate_api_key(api_key, stage):
-
     key = None
     usage_plan_id = None
 
@@ -221,8 +351,10 @@ def get_api_id_stage_invocation_path(path):
 def invoke_rest_api_from_request(method, path, data, headers, context={}):
     api_id, stage, relative_path_w_query_params = get_api_id_stage_invocation_path(path)
     try:
-        return invoke_rest_api(api_id, stage, method, relative_path_w_query_params,
-            data, headers, path=path, context=context)
+        return invoke_rest_api(
+            api_id, stage, method, relative_path_w_query_params,
+            data, headers, path=path, context=context
+        )
     except AuthorizationError as e:
         return make_error_response('Not authorized to invoke REST API %s: %s' % (api_id, e), 403)
 
@@ -231,8 +363,6 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
     path = path or invocation_path
     relative_path, query_string_params = extract_query_string_params(path=invocation_path)
 
-    # run gateway authorizers for this request
-    authorize_invocation(api_id, headers)
     path_map = helpers.get_rest_api_paths(rest_api_id=api_id)
     try:
         extracted_path, resource = get_resource_for_path(path=relative_path, path_map=path_map)
@@ -254,6 +384,19 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
             return get_cors_response(headers)
         return make_error_response('Unable to find integration for path %s' % path, 404)
 
+    # run gateway authorizers for this request
+    resource_id = resource.get('id')
+    authorization_result = authorize_invocation(api_id, resource_id, stage,
+                                                method, data,
+                                                headers, path, invocation_path,
+                                                integration)
+
+    if authorization_result:
+        LOGGER.warning(
+            f">>> Returning authorization_result: {authorization_result}"
+        )
+        return authorization_result
+
     uri = integration.get('uri') or ''
     integration_type = integration['type'].upper()
 
@@ -268,17 +411,23 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
                 path_params = {}
 
             # apply custom request template
-            data_str = apply_template(integration, 'request', data_str, path_params=path_params,
-                query_params=query_string_params, headers=headers)
+            data_str = apply_template(
+                integration, 'request', data_str, path_params=path_params,
+                query_params=query_string_params, headers=headers
+            )
 
             # Sample request context:
             # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-create-api-as-simple-proxy-for-lambda.html#api-gateway-create-api-as-simple-proxy-for-lambda-test
             request_context = get_lambda_event_request_context(method, path, data, headers,
-                integration_uri=uri, resource_id=resource.get('id'))
+                                                               integration_uri=uri, resource_id=resource_id)
 
-            result = lambda_api.process_apigateway_invocation(func_arn, relative_path, data_str,
-                stage, api_id, headers, path_params=path_params, query_string_params=query_string_params,
-                method=method, resource_path=path, request_context=request_context, event_context=context)
+            result = lambda_api.process_apigateway_invocation(
+                func_arn, relative_path, data_str,
+                stage, api_id, headers, path_params=path_params,
+                query_string_params=query_string_params,
+                method=method, resource_path=path,
+                request_context=request_context, event_context=context
+            )
 
             if isinstance(result, FlaskResponse):
                 response = flask_to_requests_response(result)
@@ -325,8 +474,12 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
             # forward records to target kinesis stream
             headers = aws_stack.mock_aws_request_headers(service='kinesis')
             headers['X-Amz-Target'] = target
-            result = common.make_http_request(url=TEST_KINESIS_URL,
-                method='POST', data=new_request, headers=headers)
+            result = common.make_http_request(
+                url=TEST_KINESIS_URL,
+                method='POST',
+                data=new_request,
+                headers=headers
+            )
             # TODO apply response template..?
             return result
 
